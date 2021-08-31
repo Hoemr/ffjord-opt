@@ -146,12 +146,16 @@ class StackedCNFLayers(layers.SequentialFlow):
             n_blocks=1,
             cnf_kwargs={},
     ):
+        # StackedCNF :
+        #      not the last one : CNF * n_blocks + squeeze + CNF * n_blocks
+        #          the last one : CNF * n_blocks
         strides = tuple([1] + [1 for _ in idims])
         chain = []
         if init_layer is not None:
             chain.append(init_layer)
 
         def _make_odefunc(size):
+            # size : input_shape
             net = ODEnet(idims, size, strides, True, layer_type="concat", nonlinearity=nonlinearity)
             f = layers.ODEfunc(net)
             return f

@@ -82,7 +82,7 @@ def get_dataset(args):
         )
         test_set = dset.CIFAR10(root="./data", train=False, transform=trans(im_size), download=True)
 
-    data_shape = (im_dim, im_size, im_size)
+    data_shape = (im_dim, im_size, im_size)    # [channel_size, H, W]
     if not args.conv:
         data_shape = (im_dim * im_size * im_size,)
 
@@ -104,6 +104,9 @@ def compute_bits_per_dim(x, model, integration_times=None):
     logpz = standard_normal_logprob(z).view(z.shape[0], -1).sum(1, keepdim=True)  # logp(z)
     logpx = logpz - delta_logp
 
+    # x.nelement: calculate the total number of elements of the input tensor.
+    # a = torch.zeros(1,2,3,4,5)
+    # >>> a.nelement() = 120
     logpx_per_dim = torch.sum(logpx) / x.nelement()  # averaged over batches
     bits_per_dim = -(logpx_per_dim - np.log(256)) / np.log(2)
 
@@ -119,7 +122,7 @@ def create_model(args, data_shape, regularization_fns):
             (args.batch_size, *data_shape),
             n_blocks=args.num_blocks,
             intermediate_dims=hidden_dims,
-            nonlinearity=args.nonlinearity,
+            nonlinearity=args.nonlinearity,   # activation function
             alpha=args.alpha,
             cnf_kwargs={"T": args.time_length, "train_T": args.train_T, "regularization_fns": regularization_fns},
         )
