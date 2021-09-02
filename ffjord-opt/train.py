@@ -28,6 +28,15 @@ from train_misc import standard_normal_logprob
 from my_rewrite import Adam_t
 
 
+def setup_seed(seed):
+    """set random seed"""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True  # 让相同的输入在相同的软件和硬件条件下输出保持一致
+    torch.backends.cudnn.benchmark = True  # cudNN基准，加速运行
+
+
 def get_train_loader(train_set, epoch):
     if args.batch_size_schedule != "":
         epochs = [0] + list(map(int, args.batch_size_schedule.split("-")))
@@ -82,7 +91,7 @@ def get_dataset(args):
         )
         test_set = dset.CIFAR10(root="./data", train=False, transform=trans(im_size), download=True)
 
-    data_shape = (im_dim, im_size, im_size)    # [channel_size, H, W]
+    data_shape = (im_dim, im_size, im_size)  # [channel_size, H, W]
     if not args.conv:
         data_shape = (im_dim * im_size * im_size,)
 
@@ -122,7 +131,7 @@ def create_model(args, data_shape, regularization_fns):
             (args.batch_size, *data_shape),
             n_blocks=args.num_blocks,
             intermediate_dims=hidden_dims,
-            nonlinearity=args.nonlinearity,   # activation function
+            nonlinearity=args.nonlinearity,  # activation function
             alpha=args.alpha,
             cnf_kwargs={"T": args.time_length, "train_T": args.train_T, "regularization_fns": regularization_fns},
         )
@@ -194,7 +203,6 @@ def create_model(args, data_shape, regularization_fns):
 
 # ===== ===== ===== ===== ===== ===== ===== ===== ===== =====
 if __name__ == '__main__':
-    torch.backends.cudnn.benchmark = True
     SOLVERS = ["dopri5", "bdf", "rk4", "midpoint", 'adams', 'explicit_adams']
 
     parser = argparse.ArgumentParser("Continuous Normalizing Flow with or without optimized t1")
@@ -202,6 +210,7 @@ if __name__ == '__main__':
     parser.add_argument("--dims", type=str, default="64,64,64")  # 不采用multi scale的取值
     parser.add_argument("--strides", type=str, default="1,1,1,1")
     parser.add_argument("--num_blocks", type=int, default=1, help='Number of stacked CNFs.')
+    parser.add_argument('--seed', type=int, default=509)
 
     parser.add_argument("--conv", type=eval, default=True, choices=[True, False])
     parser.add_argument(
@@ -227,6 +236,8 @@ if __name__ == '__main__':
     parser.add_argument('--time_optim', type=eval, default=True, choices=[True, False])  # 选择是否使用优化t1的CNF
     parser.add_argument('--train_T', type=eval, default=False)
 
+    parser.add_argument("--itr", type=int, default=0)
+    parser.add_argument("--best-loss", type=float, default=float("inf"))
     parser.add_argument("--num_epochs", type=int, default=500)
     parser.add_argument("--batch_size", type=int, default=200)
     parser.add_argument(
@@ -271,6 +282,10 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
+    args.resume = os.path.join(args.save, "checkpt.pth")
+
+    setup_seed(args.seed)
+
     utils.makedirs(args.save)
     logger = utils.get_logger(logpath=os.path.join(args.save, 'logs'), filepath=os.path.abspath(__file__))
 
@@ -285,7 +300,7 @@ if __name__ == '__main__':
     cvt = lambda x: x.type(torch.float32).to(device, non_blocking=True)
 
     # load dataset
-    train_set, test_loader, data_shape = get_dataset(args)
+    train_set, test_loader, data_shape = get_dataset(args)   # data_shape : [channel_size, H, W]
 
     # build model
     regularization_fns, regularization_coeffs = create_regularization_fns(args)
@@ -301,24 +316,33 @@ if __name__ == '__main__':
         add_spectral_norm(model, logger)
     set_cnf_options(args, model)
 
-    logger.info(model)
-    logger.info("Number of trainable parameters: {}".format(count_parameters(model)))
-
     # optimizer
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     lr = args.lr
 
-    # restore parameters
-    if args.resume is not None:
+    # load trained parameters
+    try:
+        print("Continue...")
         checkpt = torch.load(args.resume, map_location=lambda storage, loc: storage)
+
         model.load_state_dict(checkpt["state_dict"])
+
+        args = checkpt["args"]
+        best_t1 = checkpt["t1"]
+
         if "optim_state_dict" in checkpt.keys():
             optimizer.load_state_dict(checkpt["optim_state_dict"])
+
             # Manually move optimizer state to device.
             for state in optimizer.state.values():
                 for k, v in state.items():
                     if torch.is_tensor(v):
                         state[k] = cvt(v)
+
+    except:
+        print("Restart...")
+        logger.info(model)
+        logger.info("Number of trainable parameters: {}".format(count_parameters(model)))
 
     #    if torch.cuda.is_available():
     #        model = torch.nn.DataParallel(model).cuda()
@@ -334,9 +358,6 @@ if __name__ == '__main__':
 
     if args.spectral_norm and not args.resume:
         spectral_norm_power_iteration(model, 500)
-
-    best_loss = float("inf")
-    itr = 0
 
     # 定义时间上界
     t1 = torch.eye(1).to(device)
@@ -372,7 +393,7 @@ if __name__ == '__main__':
 
         for _, (x, y) in enumerate(train_loader):
             start = time.time()
-            update_lr(optimizer, itr)
+            update_lr(optimizer, args.itr)
             optimizer.zero_grad()
 
             if not args.conv:
@@ -435,24 +456,24 @@ if __name__ == '__main__':
             grad_meter.update(grad_norm)
             tt_meter.update(total_time)
 
-            if itr % args.log_freq == 0:
+            if args.itr % args.log_freq == 0:
                 log_message = (
                     "Iter {:04d} | Time {:.4f}({:.4f}) | Bit/dim {:.4f}({:.4f}) | "
                     "Steps {:.0f}({:.2f}) | Grad Norm {:.4f}({:.4f}) | Total Time {:.2f}({:.2f}) | t1 {:.4f}".format(
-                        itr, time_meter.val, time_meter.avg, loss_meter.val, loss_meter.avg, steps_meter.val,
+                        args.itr, time_meter.val, time_meter.avg, loss_meter.val, loss_meter.avg, steps_meter.val,
                         steps_meter.avg, grad_meter.val, grad_meter.avg, tt_meter.val, tt_meter.avg, t1
                     )
                 )
                 print("Iter {:04d} | Time {:.4f}({:.4f}) | Bit/dim {:.4f}({:.4f}) | "
                       "Steps {:.0f}({:.2f}) | Grad Norm {:.4f}({:.4f}) | Total Time {:.2f}({:.2f}) | t1 {:.4f}".format(
-                    itr, time_meter.val, time_meter.avg, loss_meter.val, loss_meter.avg, steps_meter.val,
+                    args.itr, time_meter.val, time_meter.avg, loss_meter.val, loss_meter.avg, steps_meter.val,
                     steps_meter.avg, grad_meter.val, grad_meter.avg, tt_meter.val, tt_meter.avg, t1
                 ))
                 if regularization_coeffs:
                     log_message = append_regularization_to_log(log_message, regularization_fns, reg_states)
                 logger.info(log_message)
 
-            itr += 1
+            args.itr += 1
         else:
             # compute test loss
             model.eval()
@@ -480,15 +501,16 @@ if __name__ == '__main__':
                     print(
                         "Epoch {:04d} | Time {:.4f}, Bit/dim {:.4f}, t1 {:.4f}".format(epoch, time.time() - start, loss,
                                                                                        t1))
-                    if loss < best_loss:
-                        best_loss = loss
+                    if loss < args.best_loss:
+                        args.best_loss = loss
                         utils.makedirs(args.save)
+                        args.begin_epoch = epoch
                         torch.save({
                             "args": args,
                             "state_dict": model.state_dict() if torch.cuda.is_available() else model.state_dict(),
                             "optim_state_dict": optimizer.state_dict(),
-                            "t1_dict": t1,
-                        }, os.path.join(args.save, "checkpt.pth"))
+                            "t1": t1,
+                        }, args.resume)
 
             if epoch % args.save_freq == 0:
                 torch.save(time_list, args.save + '_time.pkl')
